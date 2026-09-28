@@ -1,0 +1,67 @@
+/*
+ * Overlay for the M4.
+ *
+ * - Enables LPUART5, which receives the camera stream from the ESP32.
+ * - Reserves 32 KB of OCRAM2 at 0x202c0000; the M4 uses it as the shared
+ *   buffer that hands frames to the M7.
+ * - The MU mailbox and ipc0 nodes come from the Zephyr ipc_service
+ *   static_vrings sample for this SoC
+ *   (samples/subsys/ipc/ipc_service/static_vrings/remote/boards/
+ *   mimxrt1170_evk_mimxrt1176_cm4.overlay). The shared-memory hand-off
+ *   used today does not go through ipc_service.
+ */
+
+#include <zephyr/dt-bindings/ipc_service/static_vrings.h>
+#include <zephyr/dt-bindings/memory-attr/memory-attr-arm.h>
+
+/ {
+	chosen {
+		/* drop the legacy IPM channel so ipc_service can be used */
+		/delete-property/ zephyr,ipc;
+	};
+
+	ocram2_ipc0: memory@202c0000 {
+		compatible = "zephyr,memory-region", "mmio-sram";
+		reg = <0x202c0000 DT_SIZE_K(32)>;
+		zephyr,memory-region = "OCRAM2_IPC0";
+		zephyr,memory-attr = <( DT_MEM_ARM(ATTR_MPU_IO))>;
+	};
+
+	soc {
+		/delete-node/ mailbox@40c4c000;
+
+		mbox: mbox@40c4c000 {
+			compatible = "nxp,mbox-imx-mu";
+			reg = <0x40c4c000 0x4000>;
+			interrupts = <118 0>;
+			rx-channels = <4>;
+			#mbox-cells = <1>;
+			status = "okay";
+		};
+	};
+
+	ipc {
+		/delete-node/ ipc0;
+
+		ipc0: ipc0 {
+			compatible = "zephyr,ipc-openamp-static-vrings";
+			memory-region = <&ocram2_ipc0>;
+			mboxes = <&mbox 0>, <&mbox 1>;
+			mbox-names = "rx", "tx";
+			role = "remote";
+			status = "okay";
+		};
+	};
+};
+
+&lpuart5 {
+	status = "okay";
+	current-speed = <115200>;
+};
+
+/* Pull-up on the LPUART5 RX pad so the line does not float while the ESP32 is idle. */
+&pinmux_lpuart5 {
+	group0 {
+		bias-pull-up;
+	};
+};

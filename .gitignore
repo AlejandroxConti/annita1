@@ -1,0 +1,4 @@
+build*/
+*.bak*
+*.new
+m4_image_data.c
