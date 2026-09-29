@@ -6,7 +6,7 @@ Each frame is scored before it is transmitted and gets one of three outcomes: di
 
 ![Pipeline](docs/annita1_pipeline_diagram.svg)
 
-Live replay of a recorded run: `https://<github-user>.github.io/<repo>/console/`
+Live replay of a recorded run: `https://AlejandroxConti.github.io/annita1/console/`
 
 ## Pipeline
 

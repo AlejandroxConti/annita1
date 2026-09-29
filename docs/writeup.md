@@ -38,7 +38,7 @@ These are measured numbers from real hardware runs, not simulated targets:
 | 415-frame, ~19.6-minute stability run | No timing drift or gaps in any stage; **1,684,392 bytes saved**, 317 discarded, 97 compressed, over multiple real land/water scene changes presented to the camera during the run |
 | M4↔M7 crossover (acquisition/compute split) | M4 receives real camera JPEGs over its own UART and hands off validated frames to the M7 via shared memory; ~75–80% frame success in sustained live testing, zero core lockups |
 
-You can see a real, second-by-second replay of the 415-frame stability run — including live quality scores, classifier confidence, and the SVS decision — here: **[Annita-1 Telemetry Console](https://<github-user>.github.io/<repo>/console/)**. Every number in it is pulled from the actual captured log, not staged.
+You can see a real, second-by-second replay of the 415-frame stability run — including live quality scores, classifier confidence, and the SVS decision — here: **[Annita-1 Telemetry Console](https://AlejandroxConti.github.io/annita1/console/)**. Every number in it is pulled from the actual captured log, not staged.
 
 ## Engineering trade-offs
 
