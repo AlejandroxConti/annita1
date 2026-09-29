@@ -1,0 +1,14 @@
+/*
+ * Overlay for the M7 standalone application.
+ *
+ * LPUART5 is used as the external frame input interface.
+ * LPSPI1 remains disabled because it shares pads with LPUART5.
+ */
+
+&lpuart5 {
+	status = "okay";
+};
+
+&lpspi1 {
+	status = "disabled";
+};
