@@ -8,7 +8,7 @@ Each frame is scored before it is transmitted and gets one of three outcomes: di
 
 Live replay of a recorded run: `https://AlejandroxConti.github.io/annita1/console/`
 
-## Pipeline
+## Pipeline using (Conti Algorithm SVS)
 
 1. JPEG decode (TJpgDec) and 180 degree rotation on the PXP
 2. Image quality score: Laplacian-variance sharpness and contrast
