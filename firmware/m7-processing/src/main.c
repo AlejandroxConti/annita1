@@ -60,7 +60,7 @@ static uint16_t decode_len;
  *
  *   0xAA 0x55 | length_low | length_high | JPEG payload | checksum
  *
- * The checksum is the 8-bit sum of all JPEG payload bytes.
+ * The checksum is the 8-bit XOR of all JPEG payload bytes.
  */
 static void parser_reset(void)
 {
@@ -109,7 +109,7 @@ static void parser_process_byte(uint8_t byte)
 
 	case STATE_READ_PAYLOAD:
 		payload[payload_idx++] = byte;
-		running_checksum = (uint8_t)(running_checksum + byte);
+		running_checksum ^= byte;
 
 		if (payload_idx >= payload_len) {
 			rx_state = STATE_WAIT_CHECKSUM;
