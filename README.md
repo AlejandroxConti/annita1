@@ -21,7 +21,7 @@ The camera is an ESP32-S3 with an OV5640. It is a stand-in sensor; nothing in th
 ## Repository layout
 
 ```
-firmware/m7-vision-pipeline/   Cortex-M7 app: decode, PXP, IQA, features, TinyML, SVS
+firmware/m7-processing/       Cortex-M7 app: decode, PXP, IQA, features, TinyML, SVS (standalone, own UART)
 firmware/m4-acquisition/       Cortex-M4 app: UART frame receiver
 esp32/camera-firmware/         Arduino sketch: capture, JPEG, framed UART output
 docs/                          Write-up, diagrams, replay page
@@ -64,6 +64,8 @@ case ST_CHECKSUM:
 
 ## Starting the M4 from the M7
 
+This is how the M4 was launched in the integration attempt. The published `firmware/m7-processing` does not start the M4 and does not use IPC.
+
 The M4 image is built separately, embedded in the M7 app as a C array, copied to RAM at boot and released from reset:
 
 ```c
@@ -83,10 +85,12 @@ Things that cost time and are worth knowing if you do the same on this board:
 - Flush the M7 data cache after the copy. The M4 reads RAM directly and can otherwise see stale bytes.
 - The reset write to `SRC->CTRL_M4CORE` before `BT_RELEASE_M4` mirrors what Zephyr's own `second_core_boot()` does. Without it the M4 booted unreliably.
 - A byte array holding the TFLite model needs `alignas(16)`. Unaligned, `AllocateTensors()` hangs with an unaligned-access fault.
-- `CONFIG_HEAP_MEM_POOL_SIZE` defaults to 0 here, which makes `ipc_service_open_instance()` fail with `-ENOMEM`.
+- `CONFIG_HEAP_MEM_POOL_SIZE` defaults to 0 here, which makes `ipc_service_open_instance()` fail with `-ENOMEM`. (Only relevant to the earlier IPC-based attempt.)
 - With the shared-memory hand-off, invalidate the cache on the M7 side before reading what the M4 wrote.
 
 ## Build
+
+The commands below are the integration build (M4 embedded in the M7). The published `m7-processing` app does not embed the M4: build it with the M7 `west build` and `west flash` commands only.
 
 The apps were built inside a PHYTEC `zephyr-phytec-application` west workspace, each one under `my_apps/`. Board targets are `phyboard_atlas/mimxrt1176/cm4` and `phyboard_atlas/mimxrt1176/cm7`.
 
@@ -97,10 +101,10 @@ west build -b phyboard_atlas/mimxrt1176/cm4 -d build_m4 my_apps/m4-acquisition
 # embed the M4 binary in the M7 app (generated file, not committed)
 (cd build_m4/zephyr && xxd -i zephyr.bin) \
   | sed -E 's/^unsigned char [A-Za-z0-9_]+\[\]/unsigned char g_m4_image[]/; s/^unsigned int [A-Za-z0-9_]+ =/unsigned int g_m4_image_len =/' \
-  > my_apps/m7-vision-pipeline/src/m4_image/m4_image_data.c
+  > my_apps/m7-processing/src/m4_image/m4_image_data.c
 
 # M7
-west build -b phyboard_atlas/mimxrt1176/cm7 -d build my_apps/m7-vision-pipeline
+west build -b phyboard_atlas/mimxrt1176/cm7 -d build my_apps/m7-processing
 west flash -d build
 ```
 
@@ -113,12 +117,14 @@ west flash -d build
 | Classifier | 98.44% int8 accuracy, EuroSAT water vs. land |
 | 80 frames | 75 discarded, 5 compressed, 0 transmitted in full: 254,921 B saved, 8,408 B sent |
 | 415 frames, 19.6 min | no gaps or drift, 1,684,392 B saved (317 discarded, 97 compressed), land and water scenes swapped several times during the run |
-| M4 to M7 hand-off | real camera JPEGs received on the M4 and passed through shared memory, roughly 75-80% of frames validated, no core lockups |
+| M4 to M7 hand-off | earlier measurement (~75-80% of frames validated); not re-measured after the checksum fix, treat as unconfirmed |
 
 ## Status
 
-- The M4 receiver polls the UART. An interrupt-driven receiver stalled the core in testing, so completeness was traded for stability.
-- The M7 pipeline and the M4 receiver each run on the board. Running them together as one continuous loop is not finished.
+- `firmware/m7-processing` runs the full pipeline standalone: it receives the framed JPEG stream on its own LPUART5, decodes, scores, classifies and decides. In a ~5 minute run it decoded 118 consecutive frames at about one frame per 2.65 s, with 0 checksum failures. All 118 were discarded (static scene), so that run does not exercise the compress or transmit branches.
+- `firmware/m4-acquisition` receives the same stream on the M4 and publishes frames to shared memory. The M4 and M7 apps both use LPUART5 (same pins), so only one core can own the UART at a time.
+- Running M4 acquisition and M7 processing together as one loop is not finished and has not been validated.
+- Fixed: the M7 parser summed the payload bytes while the ESP32 and the M4 use XOR, so it rejected almost every frame.
 - Ideas for later: extra SVS terms (battery, contact window), more classes such as clouds, a different sensor.
 
 ## Notes
