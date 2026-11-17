@@ -41,18 +41,10 @@ typedef enum {
 /* UART frame parser                                                          */
 /* -------------------------------------------------------------------------- */
 
-static rx_state_t rx_state = STATE_WAIT_SYNC1;
 
-static uint8_t payload[MAX_PAYLOAD];
-static uint16_t payload_len;
-static uint16_t payload_idx;
-static uint8_t running_checksum;
 
-static uint32_t frames_ok;
-static uint32_t frames_bad_checksum;
 static uint32_t frames_decoded;
 static uint32_t frames_decode_failed;
-static uint32_t frames_dropped_busy;
 
 static volatile bool frame_ready;
 static volatile bool processing_frame;
@@ -67,118 +59,7 @@ static uint16_t decode_len;
  *
  * The checksum is the 8-bit XOR of all JPEG payload bytes.
  */
-static void parser_reset(void)
-{
-	rx_state = STATE_WAIT_SYNC1;
-	payload_len = 0;
-	payload_idx = 0;
-	running_checksum = 0;
-}
-
-static void parser_process_byte(uint8_t byte)
-{
-	switch (rx_state) {
-	case STATE_WAIT_SYNC1:
-		if (byte == SYNC_BYTE_1) {
-			rx_state = STATE_WAIT_SYNC2;
-		}
-		break;
-
-	case STATE_WAIT_SYNC2:
-		if (byte == SYNC_BYTE_2) {
-			rx_state = STATE_WAIT_LEN_LOW;
-		} else if (byte == SYNC_BYTE_1) {
-			rx_state = STATE_WAIT_SYNC2;
-		} else {
-			rx_state = STATE_WAIT_SYNC1;
-		}
-		break;
-
-	case STATE_WAIT_LEN_LOW:
-		payload_len = byte;
-		rx_state = STATE_WAIT_LEN_HIGH;
-		break;
-
-	case STATE_WAIT_LEN_HIGH:
-		payload_len |= ((uint16_t)byte << 8);
-
-		if (payload_len == 0 || payload_len > MAX_PAYLOAD) {
-			parser_reset();
-			break;
-		}
-
-		payload_idx = 0;
-		running_checksum = 0;
-		rx_state = STATE_READ_PAYLOAD;
-		break;
-
-	case STATE_READ_PAYLOAD:
-		payload[payload_idx++] = byte;
-		running_checksum ^= byte;
-
-		if (payload_idx >= payload_len) {
-			rx_state = STATE_WAIT_CHECKSUM;
-		}
-		break;
-
-	case STATE_WAIT_CHECKSUM:
-		if (byte == running_checksum) {
-			frames_ok++;
-
-			if (!frame_ready && !processing_frame) {
-				memcpy(decode_buf, payload, payload_len);
-				decode_len = payload_len;
-				frame_ready = true;
-			} else {
-				frames_dropped_busy++;
-			}
-		} else {
-			frames_bad_checksum++;
-		}
-
-		parser_reset();
-		break;
-
-	default:
-		parser_reset();
-		break;
-	}
-}
-
 static volatile uint32_t rx_bytes, rx_errs, rx_irqs;
-static void uart_rx_callback(const struct device *dev, void *user_data)
-{
-	ARG_UNUSED(user_data);
-
-	if (!uart_irq_update(dev)) {
-		return;
-	}
-
-	rx_irqs++;
-	if (uart_err_check(dev)) {
-		rx_errs++;
-	}
-
-	if (!uart_irq_rx_ready(dev)) {
-		return;
-	}
-
-	uint8_t rx_buf[32];
-
-	while (uart_irq_rx_ready(dev)) {
-		int len = uart_fifo_read(dev, rx_buf, sizeof(rx_buf));
-
-		if (len <= 0) {
-			break;
-		}
-
-		for (int i = 0; i < len; i++) {
-			rx_bytes++;
-			parser_process_byte(rx_buf[i]);
-		}
-	}
-}
-
 /* -------------------------------------------------------------------------- */
 /* Image buffers                                                              */
 /* -------------------------------------------------------------------------- */
