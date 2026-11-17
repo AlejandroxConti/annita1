@@ -1,134 +1,125 @@
-/*
- * Annita-1, Cortex-M4 side: camera frame receiver.
- *
- * Reads the framed JPEG stream coming from the ESP32 on LPUART5 and publishes
- * every frame that passes its checksum to shared memory, where the M7 picks it up.
- *
- * Wire format:  0xAA 0x55 | length (u16, little endian) | JPEG bytes | XOR checksum
- *
- * Shared memory (OCRAM2, base 0x202c0000):
- *   +0x00  magic      0xA5A5A5A5 once the M4 is running, 0xDEAD0002 if LPUART5 is not ready
- *   +0x04  reserved
- *   +0x08  frame_len  length in bytes of the latest valid frame
- *   +0x0C  frame_seq  incremented after every valid frame (the M7 watches this)
- *   +0x100 jpeg       frame data
- *
- * The receiver polls the UART and never sleeps or yields. During bring-up the
- * first thread switch on this core (k_msleep) locked the M4 up, so the main
- * loop is kept free of anything that forces a context switch.
- */
-
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/cache.h>
 #include <stdint.h>
+#include "fsl_cache.h"
 
-#define SHM_BASE          0x202c0000u
-#define SHM_MAGIC_ADDR    (SHM_BASE + 0x00)
-#define SHM_RESERVED_ADDR (SHM_BASE + 0x04)
-#define SHM_FRAMELEN_ADDR (SHM_BASE + 0x08)
-#define SHM_FRAMESEQ_ADDR (SHM_BASE + 0x0C)
-#define SHM_JPEG_ADDR     (SHM_BASE + 0x100)
-#define JPEG_MAX          8000u   /* the ESP32 never sends more than this */
+#define SHM_BASE      0x202c0000u
+#define SHM_MAGIC     (SHM_BASE + 0x00)
+#define SHM_LEN       (SHM_BASE + 0x08)
+#define SHM_SEQ       (SHM_BASE + 0x0C)
+#define SHM_IDX       (SHM_BASE + 0x10)
+#define SHM_CNT       (SHM_BASE + 0x14)   /* 6 x uint32 */
+#define SHM_BUF0      (SHM_BASE + 0x100)
+#define SHM_BUF1      (SHM_BASE + 0x2100)
+#define SHM_JPEG_MAX  8000u
 
-static volatile uint32_t *const shm_magic    = (volatile uint32_t *)SHM_MAGIC_ADDR;
-static volatile uint32_t *const shm_reserved = (volatile uint32_t *)SHM_RESERVED_ADDR;
-static volatile uint32_t *const shm_framelen = (volatile uint32_t *)SHM_FRAMELEN_ADDR;
-static volatile uint32_t *const shm_frameseq = (volatile uint32_t *)SHM_FRAMESEQ_ADDR;
-static volatile uint8_t  *const shm_jpeg     = (volatile uint8_t  *)SHM_JPEG_ADDR;
+#define W32(a) (*(volatile uint32_t *)(a))
 
-enum parse_state {
-	ST_WAIT_AA,
-	ST_WAIT_55,
-	ST_LEN_LO,
-	ST_LEN_HI,
-	ST_PAYLOAD,
-	ST_CHECKSUM,
-};
+enum { C_RX, C_OR, C_FE, C_BADCS, C_BADLEN, C_RESYNC, C_N };
+static uint32_t cnt[C_N];
+
+enum parse_state { ST_WAIT_AA, ST_WAIT_55, ST_LEN_LO, ST_LEN_HI, ST_PAYLOAD, ST_CHECKSUM };
+
+static void publish_counters(void)
+{
+	for (int i = 0; i < C_N; i++) {
+		W32(SHM_CNT + 4 * i) = cnt[i];
+	}
+	sys_cache_data_flush_range((void *)SHM_CNT, 4 * C_N);
+}
 
 int main(void)
 {
+	L1CACHE_DisableSystemCache();   /* SOLO diagnostico */
 	const struct device *uart = DEVICE_DT_GET(DT_NODELABEL(lpuart5));
 
 	if (!device_is_ready(uart)) {
-		*shm_magic = 0xDEAD0002u;
-		sys_cache_data_flush_range((void *)shm_magic, 4);
-		for (;;) {
-			__asm volatile("nop");
-		}
+		W32(SHM_MAGIC) = 0xDEAD0002u;
+		sys_cache_data_flush_range((void *)SHM_MAGIC, 4);
+		for (;;) { __asm volatile("nop"); }
 	}
 
-	*shm_frameseq = 0;
-	*shm_framelen = 0;
-	*shm_reserved = 0;
-	sys_cache_data_flush_range((void *)SHM_BASE, 0x10);
-	*shm_magic = 0xA5A5A5A5u;
-	sys_cache_data_flush_range((void *)shm_magic, 4);
+	W32(SHM_SEQ) = 0;
+	W32(SHM_LEN) = 0;
+	W32(SHM_IDX) = 0;
+	publish_counters();
+	sys_cache_data_flush_range((void *)SHM_BASE, 0x20);
+	W32(SHM_MAGIC) = 0xA5A5A5A6u;   /* 0xA5A5A5A6 = layout ping-pong */
+	sys_cache_data_flush_range((void *)SHM_MAGIC, 4);
 
 	enum parse_state state = ST_WAIT_AA;
-	uint16_t frame_len = 0;
-	uint16_t idx = 0;
+	uint16_t frame_len = 0, idx = 0;
 	uint8_t checksum = 0;
 	uint32_t seq = 0;
+	uint32_t pub = 0;                 /* buffer publicado */
+	volatile uint8_t *wbuf = (volatile uint8_t *)SHM_BUF1;  /* buffer de escritura */
 
 	for (;;) {
 		unsigned char c;
 
-		if (uart_poll_in(uart, &c) != 0) {
-			continue;   /* nothing received, keep polling */
+		int e = uart_err_check(uart);   /* limpia OR/FE/NF/PF */
+		if (e) {
+			if (e & UART_ERROR_OVERRUN) { cnt[C_OR]++; }
+			if (e & (UART_ERROR_FRAMING | UART_ERROR_PARITY)) { cnt[C_FE]++; }
+			cnt[C_RESYNC]++;
+			state = ST_WAIT_AA;
+			publish_counters();
 		}
+
+		if (uart_poll_in(uart, &c) != 0) {
+			continue;
+		}
+		cnt[C_RX]++;
 
 		switch (state) {
 		case ST_WAIT_AA:
-			if (c == 0xAA) {
-				state = ST_WAIT_55;
-			}
+			if (c == 0xAA) state = ST_WAIT_55;
 			break;
-
 		case ST_WAIT_55:
 			state = (c == 0x55) ? ST_LEN_LO : ST_WAIT_AA;
 			break;
-
 		case ST_LEN_LO:
 			frame_len = c;
 			state = ST_LEN_HI;
 			break;
-
 		case ST_LEN_HI:
 			frame_len |= ((uint16_t)c) << 8;
-			if (frame_len == 0 || frame_len > JPEG_MAX) {
-				state = ST_WAIT_AA;   /* bad length, resync on the next header */
+			if (frame_len == 0 || frame_len > SHM_JPEG_MAX) {
+				cnt[C_BADLEN]++;
+				state = ST_WAIT_AA;
 			} else {
 				idx = 0;
 				checksum = 0;
 				state = ST_PAYLOAD;
 			}
 			break;
-
 		case ST_PAYLOAD:
-			shm_jpeg[idx++] = c;
+			wbuf[idx++] = c;
 			checksum ^= c;
-			if (idx >= frame_len) {
-				state = ST_CHECKSUM;
-			}
+			if (idx >= frame_len) state = ST_CHECKSUM;
 			break;
-
 		case ST_CHECKSUM:
 			if (c == checksum) {
-				/* Publish: data first, then length, then the sequence number. */
-				sys_cache_data_flush_range((void *)shm_jpeg, frame_len);
-				*shm_framelen = frame_len;
+				sys_cache_data_flush_range((void *)wbuf, frame_len);
+				pub ^= 1u;                       /* el recien escrito pasa a publicado */
+				W32(SHM_LEN) = frame_len;
+				W32(SHM_IDX) = pub;
+				publish_counters();
+				sys_cache_data_flush_range((void *)SHM_LEN, 4);
+				sys_cache_data_flush_range((void *)SHM_IDX, 4);
 				seq++;
-				*shm_frameseq = seq;
-				sys_cache_data_flush_range((void *)shm_framelen, 4);
-				sys_cache_data_flush_range((void *)shm_frameseq, 4);
+				W32(SHM_SEQ) = seq;              /* ultimo */
+				sys_cache_data_flush_range((void *)SHM_SEQ, 4);
+				/* proximo frame va al otro buffer */
+				wbuf = (volatile uint8_t *)(pub ? SHM_BUF0 : SHM_BUF1);
+			} else {
+				cnt[C_BADCS]++;
 			}
-			/* On a checksum mismatch the frame is dropped. */
 			state = ST_WAIT_AA;
 			break;
 		}
 	}
-
 	return 0;
 }

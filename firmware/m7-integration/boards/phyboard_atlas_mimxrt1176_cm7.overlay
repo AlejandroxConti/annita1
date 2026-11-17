@@ -1,0 +1,14 @@
+/*
+ * M7 integration overlay.
+ * LPUART5 is owned by the M4 (frame receiver). It stays "okay" here so
+ * the M7 build still sets up its pins and clocks; the M7 never touches it.
+ * LPSPI1 stays disabled: it shares pads with LPUART5.
+ */
+
+&lpuart5 {
+	status = "okay";
+};
+
+&lpspi1 {
+	status = "disabled";
+};
