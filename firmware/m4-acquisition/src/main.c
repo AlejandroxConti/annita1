@@ -32,7 +32,6 @@ static void publish_counters(void)
 
 int main(void)
 {
-	L1CACHE_DisableSystemCache();   /* SOLO diagnostico */
 	const struct device *uart = DEVICE_DT_GET(DT_NODELABEL(lpuart5));
 
 	if (!device_is_ready(uart)) {
@@ -47,6 +46,8 @@ int main(void)
 	publish_counters();
 	sys_cache_data_flush_range((void *)SHM_BASE, 0x20);
 	W32(SHM_MAGIC) = 0xA5A5A5A6u;   /* 0xA5A5A5A6 = layout ping-pong */
+	L1CACHE_CleanInvalidateSystemCacheByRange((uint32_t)SHM_BASE, 0x40u);
+	__DSB();
 	sys_cache_data_flush_range((void *)SHM_MAGIC, 4);
 
 	enum parse_state state = ST_WAIT_AA;
@@ -109,9 +110,15 @@ int main(void)
 				publish_counters();
 				sys_cache_data_flush_range((void *)SHM_LEN, 4);
 				sys_cache_data_flush_range((void *)SHM_IDX, 4);
+				/* 1) datos + metadatos a RAM antes de publicar seq */
+				L1CACHE_CleanInvalidateSystemCacheByRange((uint32_t)SHM_BASE, 0x4200u);
+				__DSB();
 				seq++;
 				W32(SHM_SEQ) = seq;              /* ultimo */
 				sys_cache_data_flush_range((void *)SHM_SEQ, 4);
+				/* 2) publicar seq */
+				L1CACHE_CleanInvalidateSystemCacheByRange((uint32_t)SHM_BASE, 0x20u);
+				__DSB();
 				/* proximo frame va al otro buffer */
 				wbuf = (volatile uint8_t *)(pub ? SHM_BUF0 : SHM_BUF1);
 			} else {
