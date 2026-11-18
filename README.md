@@ -22,6 +22,7 @@ The camera is an ESP32-S3 with an OV5640. It is a stand-in sensor; nothing in th
 
 ```
 firmware/m7-processing/       Cortex-M7 app: decode, PXP, IQA, features, TinyML, SVS (standalone, own UART)
+firmware/m7-integration/      Cortex-M7 app: starts the M4, reads its frames from shared memory, same pipeline
 firmware/m4-acquisition/       Cortex-M4 app: UART frame receiver
 esp32/camera-firmware/         Arduino sketch: capture, JPEG, framed UART output
 docs/                          Write-up, diagrams, replay page
@@ -64,7 +65,7 @@ case ST_CHECKSUM:
 
 ## Starting the M4 from the M7
 
-This is how the M4 was launched in the integration attempt. The published `firmware/m7-processing` does not start the M4 and does not use IPC.
+`firmware/m7-integration` starts the M4 this way. `firmware/m7-processing` does not start the M4 and does not use IPC.
 
 The M4 image is built separately, embedded in the M7 app as a C array, copied to RAM at boot and released from reset:
 
@@ -87,10 +88,11 @@ Things that cost time and are worth knowing if you do the same on this board:
 - A byte array holding the TFLite model needs `alignas(16)`. Unaligned, `AllocateTensors()` hangs with an unaligned-access fault.
 - `CONFIG_HEAP_MEM_POOL_SIZE` defaults to 0 here, which makes `ipc_service_open_instance()` fail with `-ENOMEM`. (Only relevant to the earlier IPC-based attempt.)
 - With the shared-memory hand-off, invalidate the cache on the M7 side before reading what the M4 wrote.
+- M4 writes did not reach the RAM the M7 reads until the M4's system cache (LMEM) was managed explicitly. The M4 now keeps it enabled and cleans the shared region by range (`L1CACHE_CleanInvalidateSystemCacheByRange`) in two steps: data and metadata first, then `frameseq`. Disabling the M4 system cache also worked. The exact mechanism was not isolated by a direct measurement; this is the explanation consistent with the observed contrast.
 
 ## Build
 
-The commands below are the integration build (M4 embedded in the M7). The published `m7-processing` app does not embed the M4: build it with the M7 `west build` and `west flash` commands only.
+The commands below build the integration (M4 embedded in `m7-integration`). `m7-processing` does not embed the M4: skip the `xxd` step and build it directly. `firmware/rebuild_integration.sh` automates the integration build but contains paths from the author's machine (`~/vffe-rt1170`), so adapt it before use. The repo has not yet been built from a clean workspace.
 
 The apps were built inside a PHYTEC `zephyr-phytec-application` west workspace, each one under `my_apps/`. Board targets are `phyboard_atlas/mimxrt1176/cm4` and `phyboard_atlas/mimxrt1176/cm7`.
 
@@ -101,10 +103,10 @@ west build -b phyboard_atlas/mimxrt1176/cm4 -d build_m4 my_apps/m4-acquisition
 # embed the M4 binary in the M7 app (generated file, not committed)
 (cd build_m4/zephyr && xxd -i zephyr.bin) \
   | sed -E 's/^unsigned char [A-Za-z0-9_]+\[\]/unsigned char g_m4_image[]/; s/^unsigned int [A-Za-z0-9_]+ =/unsigned int g_m4_image_len =/' \
-  > my_apps/m7-processing/src/m4_image/m4_image_data.c
+  > my_apps/m7-integration/src/m4_image/m4_image_data.c
 
 # M7
-west build -b phyboard_atlas/mimxrt1176/cm7 -d build my_apps/m7-processing
+west build -b phyboard_atlas/mimxrt1176/cm7 -d build my_apps/m7-integration
 west flash -d build
 ```
 
@@ -117,15 +119,19 @@ west flash -d build
 | Classifier | 98.44% int8 accuracy, EuroSAT water vs. land |
 | 80 frames | 75 discarded, 5 compressed, 0 transmitted in full: 254,921 B saved, 8,408 B sent |
 | 415 frames, 19.6 min | no gaps or drift, 1,684,392 B saved (317 discarded, 97 compressed), land and water scenes swapped several times during the run |
-| M4 to M7 hand-off | earlier measurement (~75-80% of frames validated); not re-measured after the checksum fix, treat as unconfirmed |
+| M4 to M7 hand-off | final configuration: 333 frames received by the M4 and 333 processed by the M7 in ~14 min, with 0 UART errors, 0 checksum failures and 0 skipped/torn/busy frames (static scene, all discarded). An earlier variant with the M4 system cache disabled: 491/491 in ~22 min |
+
+The 80-frame and 415-frame rows, the ESP32 JPEG figures and the stage timings come from earlier runs; they have not been re-verified against logs of the current firmware.
 
 ## Status
 
-- `firmware/m7-processing` runs the full pipeline standalone: it receives the framed JPEG stream on its own LPUART5, decodes, scores, classifies and decides. In a ~5 minute run it decoded 118 consecutive frames at about one frame per 2.65 s, with 0 checksum failures. All 118 were discarded (static scene), so that run does not exercise the compress or transmit branches.
-- `firmware/m4-acquisition` receives the same stream on the M4 and publishes frames to shared memory. The M4 and M7 apps both use LPUART5 (same pins), so only one core can own the UART at a time.
-- Running M4 acquisition and M7 processing together as one loop is not finished and has not been validated.
+- `firmware/m7-integration` + `firmware/m4-acquisition` run as one loop: the M4 owns LPUART5 and validates frames (XOR checksum, ping-pong buffers), the M7 copies them from shared memory with a sequence re-check and runs the pipeline. A ~14 minute run processed 333 of 333 frames with all error counters at 0.
+- That run used a nearly static scene, so every frame was discarded. It validates the transport, not the SVS.
+- The compress branch was exercised with a blue object in front of the camera (water probability 0.98-0.99). That is a functional demonstration, not an evaluation of the classifier: it may be reacting to color. A labeled test set is still needed.
+- `firmware/m7-processing` runs the same pipeline standalone, receiving on its own LPUART5 (118 consecutive frames, 0 checksum failures).
 - Fixed: the M7 parser summed the payload bytes while the ESP32 and the M4 use XOR, so it rejected almost every frame.
-- Ideas for later: extra SVS terms (battery, contact window), more classes such as clouds, a different sensor.
+- Open: root cause of the M4 cache incoherence (see above), a protocol v2 (CRC16, sequence number, payload type), and a clean-workspace build of the repo.
+- Ideas for later: extra SVS terms (battery, contact window), more classes such as clouds, other payload types, fault injection and an external watchdog.
 
 ## Notes
 
